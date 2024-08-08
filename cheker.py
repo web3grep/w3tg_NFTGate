@@ -31,20 +31,20 @@ def get_chain_id(chain_name):
     }
     return chain_mapping.get(chain_name)
 
-async def check_token_balance(session, chain, contract, address, token_id=None):
+async def get_nft_holders(session, chain, contract):
     chain_id = get_chain_id(chain)
     if not chain_id:
         logger.error(f"Chain ID not found for chain: {chain}")
-        return False
+        return set()
 
     payload = {
         "jsonrpc": "2.0",
-        "method": "ankr_getNFTsByOwner",
+        "method": "ankr_getNFTHolders",
         "params": {
-            "blockchain": [chain_id],
-            "walletAddress": address,
-            "filter": [{contract: [token_id] if token_id else []}],
-            "pageSize": 1
+            "blockchain": chain_id,
+            "contractAddress": contract,
+            "pageSize": 1000,
+            "pageToken": ""
         },
         "id": 1
     }
@@ -54,33 +54,30 @@ async def check_token_balance(session, chain, contract, address, token_id=None):
             data = await response.json()
             logger.debug(f"API response: {data}")
 
-            if "result" in data and "assets" in data["result"]:
-                for asset in data["result"]["assets"]:
-                    if asset["contractAddress"].lower() == contract.lower():
-                        if token_id:
-                            if asset["tokenId"] == token_id and int(asset["quantity"]) > 0:
-                                return True
-                        else:
-                            if int(asset["quantity"]) > 0:
-                                return True
-            return False
+            if "result" in data and "holders" in data["result"]:
+                return set(holder.lower() for holder in data["result"]["holders"])
+            return set()
     except Exception as e:
-        logger.error(f"Error checking token balance: {e}")
-        return False
+        logger.error(f"Error getting NFT holders: {e}")
+        return set()
 
-
-async def check_user_tokens(session, address):
+async def check_user_tokens(session, address, holders_cache):
+    address = address.lower()
     for token in TOKENS_TO_CHECK:
         parts = token.split(':')
         logger.debug(f"Checking token: {token} for address: {address}")
 
         if len(parts) == 3:  # ERC1155
             chain, contract, token_id = parts
-            if await check_token_balance(session, chain, contract, address, token_id):
+            if contract not in holders_cache:
+                holders_cache[contract] = await get_nft_holders(session, chain, contract)
+            if address in holders_cache[contract]:
                 return True
         elif len(parts) == 2:  # ERC20 или ERC721
             chain, contract = parts
-            if await check_token_balance(session, chain, contract, address):
+            if contract not in holders_cache:
+                holders_cache[contract] = await get_nft_holders(session, chain, contract)
+            if address in holders_cache[contract]:
                 return True
     return False
 
@@ -88,6 +85,7 @@ async def update_user_statuses():
     user_data = await load_data(DICTIONARY_FILE)
     user_statuses = await load_data(USER_STATUS_FILE)
     status_counters = user_statuses.get('counters', {})
+    holders_cache = {}
 
     async with aiohttp.ClientSession() as session:
         for user_id, address in user_data['user_addresses'].items():
@@ -95,7 +93,7 @@ async def update_user_statuses():
                 user_statuses[user_id] = 'invalid'
                 status_counters[user_id] = 0
 
-            is_valid = await check_user_tokens(session, address)
+            is_valid = await check_user_tokens(session, address, holders_cache)
             current_status = user_statuses.get(user_id, 'invalid')
 
             if is_valid:
